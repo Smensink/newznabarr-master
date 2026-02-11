@@ -26,7 +26,9 @@ class AnnasArchiveSearch(PluginSearchBase):
         Search Anna's Archive for books matching the query
         Uses Selenium for JavaScript rendering
         """
+        self.last_error = None
         if not query:
+            self.last_error = "Missing query"
             return []
         
         from selenium_helper import SeleniumHelper
@@ -41,28 +43,29 @@ class AnnasArchiveSearch(PluginSearchBase):
         full_url = f"{search_url}?{urlencode(params)}"
         
         try:
-            # Try FlareSolverr first
+            # Prefer regular Selenium first so local/test stubs can be used,
+            # then fall back to FlareSolverr for anti-bot protected pages.
             try:
-                print(f"Attempting Anna's Archive search with FlareSolverr...")
-                html = SeleniumHelper.get_page_source_flaresolverr(full_url, max_timeout=60000)
-                print(f"FlareSolverr succeeded")
-            except Exception as flare_error:
-                print(f"FlareSolverr failed ({flare_error}), falling back to regular Selenium")
-                # Fallback to regular Selenium
                 html = SeleniumHelper.get_page_source(
                     full_url,
                     wait_for_selector="a[href]",  # Wait for any links to load
                     wait_time=45
                 )
+            except Exception as selenium_error:
+                print(f"Selenium failed ({selenium_error}), trying FlareSolverr")
+                html = SeleniumHelper.get_page_source_flaresolverr(full_url, max_timeout=60000)
             
             books = self._parse_search_results(html)
             results = self._convert_results(books, cat)
             
             print(f"Found {len(results)} results from Anna's Archive")
+            if not results:
+                self.last_error = "No results returned"
             return results
             
         except Exception as e:
             print(f"Anna's Archive error: {e}")
+            self.last_error = str(e)
             return []
     
     def _parse_search_results(self, html):
@@ -94,14 +97,19 @@ class AnnasArchiveSearch(PluginSearchBase):
                     continue
                 seen_md5.add(md5)
                 
-                # Get title from link text or nearby elements
+                # Use nearest container to extract rich metadata.
+                container = link.find_parent(['article', 'li', 'div']) or link.parent
+                context_text = container.get_text(" ", strip=True) if container else link.get_text(" ", strip=True)
+
+                # Get title from link text or nearby heading.
                 title = link.get_text(strip=True)
-                if not title:
-                    # Try parent elements
-                    parent = link.parent
-                    if parent:
-                        title = parent.get_text(strip=True)[:200]  # Limit length
-                
+                if not title and container:
+                    heading = container.find(['h1', 'h2', 'h3', 'strong'])
+                    if heading:
+                        title = heading.get_text(" ", strip=True)
+                if not title and container:
+                    title = context_text[:200]  # Last fallback
+
                 if not title or len(title) < 3:
                     continue
                 
@@ -111,78 +119,31 @@ class AnnasArchiveSearch(PluginSearchBase):
                     'md5': md5,
                 }
                 
-                # Try to find metadata in surrounding text
-                # Anna's Archive typically shows format, size, language near the link
-                if link.parent:
-                    context_text = link.parent.get_text()
-                    
-                    # Extract format
-                    format_match = re.search(r'\b(epub|pdf|mobi|azw3|djvu)\b', context_text, re.I)
-                    if format_match:
-                        book['extension'] = format_match.group(1).lower()
-                    
-                    # Extract size
-                    size_match = re.search(r'([\d.]+)\s*(MB|KB|GB)', context_text, re.I)
-                    if size_match:
-                        book['size'] = f"{size_match.group(1)}{size_match.group(2)}"
+                # Extract metadata from surrounding text.
+                author_match = re.search(r'\bby\s+([^|,\n\r]+)', context_text, re.I)
+                if author_match:
+                    book['author'] = author_match.group(1).strip(" -")
+
+                format_match = re.search(r'\b(epub|pdf|mobi|azw3|djvu|txt)\b', context_text, re.I)
+                if format_match:
+                    book['extension'] = format_match.group(1).lower()
+
+                size_match = re.search(r'([\d.]+)\s*(MB|KB|GB|B)\b', context_text, re.I)
+                if size_match:
+                    book['size'] = f"{size_match.group(1)}{size_match.group(2)}"
+
+                lang_match = re.search(
+                    r'\b(English|Spanish|French|German|Italian|Portuguese|Dutch|Russian|Japanese|Chinese)\b',
+                    context_text,
+                    re.I,
+                )
+                if lang_match:
+                    book['language'] = lang_match.group(1)
                 
                 books.append(book)
                 
                 if len(books) >= 25:
                     break
-                    
-            except Exception as e:
-                print(f"Error parsing Anna's Archive result: {e}")
-                continue
-        
-        return books
-        
-        for div in result_divs:
-            try:
-                book = {}
-                
-                # Extract MD5 link
-                link_elem = div if div.name == 'a' else div.find('a', href=re.compile(r'/md5/'))
-                if link_elem:
-                    md5_path = link_elem.get('href', '')
-                    if md5_path:
-                        book['link'] = f"{self.BASE_URL}{md5_path}"
-                        book['md5'] = md5_path.split('/md5/')[-1] if '/md5/' in md5_path else ''
-                
-                # Extract title and author
-                title_elem = div.find('h3') or div.find('div', class_='truncate')
-                if title_elem:
-                    title_text = title_elem.get_text(strip=True)
-                    book['title'] = title_text
-                
-                # Extract metadata (format, size, language, etc.)
-                metadata_elem = div.find('div', class_='line-clamp-[2]') or div.find('div', class_='text-xs')
-                if metadata_elem:
-                    metadata_text = metadata_elem.get_text(strip=True)
-                    
-                    # Extract format
-                    format_match = re.search(r'\b(epub|pdf|mobi|azw3|djvu|txt)\b', metadata_text, re.I)
-                    if format_match:
-                        book['extension'] = format_match.group(1).lower()
-                    
-                    # Extract file size
-                    size_match = re.search(r'([\d.]+)\s*(MB|KB|GB)', metadata_text, re.I)
-                    if size_match:
-                        book['size'] = f"{size_match.group(1)}{size_match.group(2)}"
-                    
-                    # Extract language
-                    lang_match = re.search(r'\b(English|Spanish|French|German|Italian|Portuguese)\b', metadata_text, re.I)
-                    if lang_match:
-                        book['language'] = lang_match.group(1)
-                
-                # Extract author (usually in metadata or separate field)
-                author_elem = div.find('div', string=re.compile(r'by ', re.I))
-                if author_elem:
-                    author_text = author_elem.get_text(strip=True)
-                    book['author'] = re.sub(r'^by\s+', '', author_text, flags=re.I)
-                
-                if book.get('link') and book.get('title'):
-                    books.append(book)
                     
             except Exception as e:
                 print(f"Error parsing Anna's Archive result: {e}")

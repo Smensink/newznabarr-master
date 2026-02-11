@@ -14,8 +14,8 @@ services:
     ports:
       - "10000:10000"
     volumes:
-      - ./:/app
-      - ./downloads:/downloads
+      - ./config:/config
+      - ./downloads:/data/downloads/downloadarr
     depends_on:
       - flaresolverr
     restart: unless-stopped

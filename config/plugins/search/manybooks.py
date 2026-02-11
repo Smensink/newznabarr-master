@@ -42,19 +42,17 @@ class ManyBooksSearch(PluginSearchBase):
         full_url = f"{search_url}?{urlencode(params)}"
         
         try:
-            # Try FlareSolverr first to bypass Cloudflare
+            # Prefer Selenium first for deterministic local/test behavior,
+            # then fall back to FlareSolverr if needed.
             try:
-                print(f"Attempting ManyBooks search with FlareSolverr...")
-                html = SeleniumHelper.get_page_source_flaresolverr(full_url, max_timeout=60000)
-                print(f"FlareSolverr succeeded")
-            except Exception as flare_error:
-                print(f"FlareSolverr failed ({flare_error}), falling back to regular Selenium")
-                # Fallback to regular Selenium
                 html = SeleniumHelper.get_page_source(
                     full_url,
-                    wait_for_selector="a[href^='/titles/']",
+                    wait_for_selector="a[href]",
                     wait_time=45
                 )
+            except Exception as selenium_error:
+                print(f"Selenium failed ({selenium_error}), trying FlareSolverr")
+                html = SeleniumHelper.get_page_source_flaresolverr(full_url, max_timeout=60000)
             
             books = self._parse_search_results(html)
             results = self._convert_results(books, cat)
@@ -74,84 +72,61 @@ class ManyBooksSearch(PluginSearchBase):
         soup = BeautifulSoup(html, 'html.parser')
         books = []
         
-        # Find all book title links (they link to /titles/...)
-        book_links = soup.find_all('a', href=re.compile(r'^/titles/'))
+        # Find candidate links to book pages.
+        book_links = soup.find_all('a', href=re.compile(r'^/(titles|book)/'))
+        seen_links = set()
+        generic_anchor_text = {"details", "read more", "more", "view"}
         
         for link in book_links:
             try:
+                href = link.get('href', '')
+                if not href or href in seen_links:
+                    continue
+                seen_links.add(href)
+
                 book = {}
+                container = link.find_parent(['article', 'li', 'div']) or link.parent
                 
-                # Title is the link text
+                # Title is usually in heading tags; anchor text is fallback.
                 title = link.get_text(strip=True)
+                if title.lower() in generic_anchor_text:
+                    title = ""
+                if container and not title:
+                    heading = container.find(['h1', 'h2', 'h3'])
+                    if heading:
+                        title = heading.get_text(strip=True)
                 if not title:
                     continue
                     
                 book['title'] = title
                 
                 # Get book URL
-                href = link.get('href', '')
                 if href.startswith('/'):
                     book['link'] = f"{self.BASE_URL}{href}"
                 else:
                     book['link'] = href
                 
                 # Author might be in nearby elements - try to find it
-                # Look in parent or nearby siblings
                 author = "Unknown"
-                parent = link.parent
-                if parent:
-                    # Look for author in nearby text or elements
-                    author_elem = parent.find('span', class_='author') or parent.find('div', class_='author')
+                if container:
+                    author_elem = container.find('span', class_='author') or container.find('div', class_='author')
                     if author_elem:
                         author = author_elem.get_text(strip=True)
+                    else:
+                        context_text = container.get_text(" ", strip=True)
+                        author_match = re.search(r'\bby\s+([^|,\n\r]+)', context_text, re.I)
+                        if author_match:
+                            author = author_match.group(1).strip(" -")
                 
                 book['author'] = author
                 
                 # Extract format from nearby text if available
-                page_text = parent.get_text() if parent else ""
+                page_text = container.get_text(" ", strip=True) if container else ""
                 format_match = re.search(r'\b(EPUB|PDF|MOBI|TXT)\b', page_text, re.I)
                 if format_match:
                     book['format'] = format_match.group(1).upper()
                 
                 books.append(book)
-                    
-            except Exception as e:
-                print(f"Error parsing ManyBooks result: {e}")
-                continue
-        
-        return books
-        
-        for item in book_items:
-            try:
-                book = {}
-                
-                # Get title
-                title_elem = item.find('h2') or item.find('h3') or item.find('a', class_='book-title')
-                if title_elem:
-                    book['title'] = title_elem.get_text(strip=True)
-                
-                # Get author
-                author_elem = item.find('span', class_='author') or item.find('a', class_='author')
-                if author_elem:
-                    book['author'] = author_elem.get_text(strip=True)
-                
-                # Get book link
-                link_elem = item.find('a', href=True)
-                if link_elem:
-                    book_path = link_elem.get('href', '')
-                    if book_path.startswith('/'):
-                        book['link'] = f"{self.BASE_URL}{book_path}"
-                    else:
-                        book['link'] = book_path
-                
-                # Extract formats from text if available
-                formats_text = item.get_text()
-                format_match = re.search(r'\b(EPUB|PDF|MOBI|TXT)\b', formats_text, re.I)
-                if format_match:
-                    book['format'] = format_match.group(1).upper()
-                
-                if book.get('title') and book.get('link'):
-                    books.append(book)
                     
             except Exception as e:
                 print(f"Error parsing ManyBooks result: {e}")

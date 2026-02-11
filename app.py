@@ -2,6 +2,7 @@ import os
 import importlib
 import sys
 import json
+import re
 from collections import deque
 from datetime import datetime
 from flask import Flask, request, Response, jsonify, render_template_string
@@ -43,6 +44,8 @@ log_entries = deque(maxlen=200)
 download_thread = None
 _last_queue_report = None
 initialization_lock = threading.Lock()
+startup_lock = threading.Lock()
+startup_started = False
 initialization_state = {
     "status": "starting",
     "message": "Loading configuration...",
@@ -54,7 +57,7 @@ initialization_state = {
 # falsk app
 app = Flask(__name__)
 
-DASHBOARD_TEMPLATE = """
+DASHBOARD_TEMPLATE = r"""
 <!doctype html>
 <html lang="en">
   <head>
@@ -650,6 +653,8 @@ SETTINGS_TEMPLATE = """
       .message-error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
     </style>
     <script>
+      const settingsAuthKey = {{ settings_auth_key|tojson }};
+
       function saveSettings() {
         const plugins = {};
         document.querySelectorAll('[data-plugin]').forEach(toggle => {
@@ -666,7 +671,10 @@ SETTINGS_TEMPLATE = """
         
         fetch('/api/settings/save', {
           method: 'POST',
-          headers: {'Content-Type': 'application/json'},
+          headers: {
+            'Content-Type': 'application/json',
+            'X-API-Key': settingsAuthKey
+          },
           body: JSON.stringify(settings)
         })
         .then(r => r.json())
@@ -772,6 +780,78 @@ def update_initialization_state(**updates):
 def get_initialization_state():
     with initialization_lock:
         return dict(initialization_state)
+
+
+SAFE_COMPONENT_PATTERN = re.compile(r"[^A-Za-z0-9._ -]+")
+
+
+def sanitize_path_component(value, fallback):
+    text = str(value or "").strip().replace("\\", "/")
+    # Keep only the last segment to prevent path traversal via slashes.
+    text = text.split("/")[-1]
+    text = SAFE_COMPONENT_PATTERN.sub("_", text).strip(" .")
+    if not text or text in {".", ".."}:
+        return fallback
+    return text[:180]
+
+
+def ensure_queue_safe_fields(entry):
+    safe_title = sanitize_path_component(entry.get("safe_title") or entry.get("title"), "download")
+    safe_cat = sanitize_path_component(entry.get("safe_cat") or entry.get("cat"), "uncategorized")
+    changed = False
+    if entry.get("safe_title") != safe_title:
+        entry["safe_title"] = safe_title
+        changed = True
+    if entry.get("safe_cat") != safe_cat:
+        entry["safe_cat"] = safe_cat
+        changed = True
+    return changed
+
+
+def normalize_sab_categories(categories):
+    if isinstance(categories, str):
+        categories = [part.strip() for part in categories.split(",")]
+    if not isinstance(categories, list):
+        return []
+    return [str(cat).strip() for cat in categories if str(cat).strip()]
+
+
+def apply_runtime_config(config):
+    global DOWNLOAD_DIR
+    global SAB_API
+    global SAB_CATEGORIES
+    if not isinstance(config, dict):
+        return
+    DOWNLOAD_DIR = os.path.abspath(config.get("download_directory", DOWNLOAD_DIR))
+    SAB_API = str(config.get("sab_api", SAB_API)).strip() or SAB_API
+    SAB_CATEGORIES = normalize_sab_categories(config.get("sab_categories", SAB_CATEGORIES))
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+
+def get_request_api_key():
+    return (
+        request.args.get("apikey")
+        or request.form.get("apikey")
+        or request.headers.get("X-API-Key")
+        or ""
+    ).strip()
+
+
+def api_key_is_valid():
+    expected = str(SAB_API).strip()
+    return bool(expected) and get_request_api_key() == expected
+
+
+def startup_once():
+    global startup_started
+    if startup_started:
+        return
+    with startup_lock:
+        if startup_started:
+            return
+        initial_config = bootstrap_core()
+        start_async(initial_config)
+        startup_started = True
 
 # load all the search plugins
 def load_search_plugins(search_plugin_directory, config=None):
@@ -882,8 +962,18 @@ def run_download_queue():
 
                 for dlplugin in download_plugins:
                     if dl["prefix"] in dlplugin.getprefix():
+                        safe_title = sanitize_path_component(dl.get("safe_title") or dl.get("title"), "download")
+                        safe_cat = sanitize_path_component(dl.get("safe_cat") or dl.get("cat"), "uncategorized")
+                        dl["safe_title"] = safe_title
+                        dl["safe_cat"] = safe_cat
                         log_event(f"Starting download for '{dl['title']}' via {dlplugin.__class__.__name__}")
-                        result = dlplugin.download(dl["url"],dl["title"],DOWNLOAD_DIR,dl["cat"], progress_callback=progress_callback)
+                        result = dlplugin.download(
+                            dl["url"],
+                            safe_title,
+                            DOWNLOAD_DIR,
+                            safe_cat,
+                            progress_callback=progress_callback,
+                        )
                         handled = True
                         if result == "404":
                             dl["status"] = "Failed"
@@ -957,19 +1047,17 @@ def normalize_queue_entries():
             dl["progress"] = dl.get("progress", None)
         if "speed_bps" not in dl:
             dl["speed_bps"] = 0
+            changed = True
+        if ensure_queue_safe_fields(dl):
+            changed = True
     if changed:
         sabsavequeue(CONFIG_DIR, sabqueue)
 
 
 def bootstrap_core():
     config = read_config(os.path.join(CONFIG_DIR, "config.json")) or {}
-    global DOWNLOAD_DIR
-    global SAB_API
-    global SAB_CATEGORIES
     if config:
-        DOWNLOAD_DIR = config.get("download_directory", DOWNLOAD_DIR)
-        SAB_API = config.get("sab_api", SAB_API)
-        SAB_CATEGORIES = config.get("sab_categories", SAB_CATEGORIES)
+        apply_runtime_config(config)
     log_event("Loading persistent queue")
     health_monitor.log_activity("Loading persistent queue", status="info")
     global sabqueue
@@ -1228,6 +1316,11 @@ def render_dashboard():
     )
 
 
+@app.before_request
+def _ensure_started():
+    startup_once()
+
+
 @app.route("/")
 def home():
     return render_dashboard()
@@ -1301,14 +1394,18 @@ def settings():
         download_directory=config.get("download_directory", "/data/downloads/downloadarr"),
         sab_api=config.get("sab_api", "abcde"),
         sab_categories=cats_text,
-        libgen_mirrors=mirrors_text
+        libgen_mirrors=mirrors_text,
+        settings_auth_key=SAB_API,
     )
 
 @app.route("/api/settings/save", methods=["POST"])
 def save_settings():
     """API endpoint to save settings"""
     try:
-        new_settings = request.get_json()
+        if not api_key_is_valid():
+            return jsonify({"success": False, "error": "Access Denied"}), 403
+
+        new_settings = request.get_json(silent=True) or {}
         config_path = os.path.join(CONFIG_DIR, "config.json")
         
         # Read current config
@@ -1316,24 +1413,31 @@ def save_settings():
         
         # Update with new settings
         current_config["plugin_settings"] = new_settings.get("plugin_settings", {})
-        current_config["download_directory"] = new_settings.get("download_directory", "/data/downloads/downloadarr")
-        current_config["sab_api"] = new_settings.get("sab_api", "abcde")
-        current_config["sab_categories"] = new_settings.get("sab_categories", [])
-        current_config["libgen_mirrors"] = new_settings.get("libgen_mirrors", [])
+        current_config["download_directory"] = str(
+            new_settings.get("download_directory", "/data/downloads/downloadarr")
+        ).strip() or "/data/downloads/downloadarr"
+        current_config["sab_api"] = str(new_settings.get("sab_api", "abcde")).strip() or "abcde"
+        current_config["sab_categories"] = normalize_sab_categories(new_settings.get("sab_categories", []))
+        current_config["libgen_mirrors"] = [
+            str(m).strip() for m in new_settings.get("libgen_mirrors", []) if str(m).strip()
+        ]
         
-        # Write config back
         # Write config back
         with open(config_path, 'w') as f:
             json.dump(current_config, f, indent=2)
+
+        # Apply runtime settings immediately.
+        apply_runtime_config(current_config)
             
         # Update loaded plugins in real-time
-        plugin_settings = new_settings.get("plugin_settings", {})
+        plugin_settings = current_config.get("plugin_settings", {})
         for plugin in search_plugins:
             if hasattr(plugin, 'id') and plugin.id in plugin_settings:
                 plugin.enabled = plugin_settings[plugin.id].get("enabled", False)
                 
         # Refresh health status
         health_monitor.check_all_plugins(search_plugins, download_plugins)
+        ensure_download_worker()
         
         return jsonify({"success": True})
     except Exception as e:
@@ -1351,10 +1455,12 @@ def api():
     # This is called when Readarr/Lidarr/etc. sends a download request
     if mode == "addurl":
         try:
+            if not api_key_is_valid():
+                return jsonify({"status": False, "error": "Access Denied"}), 403
+
             # Get parameters from either args or form
             name = request.args.get("name") or request.form.get("name")
             cat = request.args.get("cat") or request.form.get("cat") or ""
-            priority = request.args.get("priority") or request.form.get("priority") or "-100"
             
             if not name:
                 return jsonify({"status": False, "error": "Missing 'name' parameter"}), 400
@@ -1373,6 +1479,8 @@ def api():
             url = params['url'][0]
             prefix = params['prefix'][0].strip()
             title = params['title'][0]
+            safe_title = sanitize_path_component(title, "download")
+            safe_cat = sanitize_path_component(cat, "uncategorized")
             size_param = params.get('size', ['0'])[0]
             try:
                 size_bytes = int(size_param)
@@ -1390,8 +1498,10 @@ def api():
                 "url": url,
                 "prefix": prefix,
                 "cat": cat,
+                "safe_cat": safe_cat,
                 "status": "Queued",
                 "storage": None,
+                "safe_title": safe_title,
                 "size": size_bytes,
                 "bytes_total": size_bytes,
                 "bytes_downloaded": 0,
@@ -1566,7 +1676,7 @@ def api():
         return sabversion()
 
     elif mode == "get_config":
-        if SAB_API == request.args.get("apikey"):
+        if api_key_is_valid():
             sabconfig = sabgetconfig(SAB_CATEGORIES)
             sabconfig["config"]["misc"]["complete_dir"] = DOWNLOAD_DIR
             sabconfig["config"]["misc"]["api_key"] = SAB_API
@@ -1574,7 +1684,7 @@ def api():
         return jsonify({"error": "Access Denied"}), 403
 
     elif mode == "addfile":
-        if SAB_API == request.args.get("apikey"):
+        if api_key_is_valid():
             uploaded_file=request.files["name"]
             file_text = uploaded_file.read()
             root = ET.fromstring(file_text)
@@ -1597,7 +1707,9 @@ def api():
                 "nzo": nzo,
                 "title": title,
                 "status": "Queued",
-                "cat": request.args.get("cat")
+                "cat": request.args.get("cat"),
+                "safe_title": sanitize_path_component(title, "download"),
+                "safe_cat": sanitize_path_component(request.args.get("cat"), "uncategorized"),
             })
             log_event(f"Queued job '{title}' (cat: {request.args.get('cat')})")
             result=json.loads("""{"status":true,"nzo_ids":["SABnzbd_nzo_cqz8nwn8"]}""")
@@ -1607,7 +1719,7 @@ def api():
         return jsonify({"error": "Access Denied"}), 403
 
     elif mode == "queue":
-        if SAB_API == request.args.get("apikey"):
+        if api_key_is_valid():
             if "name" in request.args:
                 if request.args.get("name") == "delete":
                     sabqueue = sabdeletefromqueue(CONFIG_DIR,sabqueue,request.args.get("value"))
@@ -1617,7 +1729,7 @@ def api():
         return jsonify({"error": "Access Denied"}), 403
 
     elif mode == "history":
-        if SAB_API == request.args.get("apikey"):
+        if api_key_is_valid():
             if "name" in request.args:
                 if request.args.get("name") == "delete":
                     sabqueue = sabdeletefromqueue(CONFIG_DIR,sabqueue,request.args.get("value"))
@@ -1629,9 +1741,7 @@ def api():
     log_event(f"Unknown /api request - mode='{mode}', t='{query_type}', download='{download_action}'")
     return jsonify({"status": False, "error": "Unsupported request"}), 400
 
-_initial_config = bootstrap_core()
-start_async(_initial_config)
-
 if __name__ == "__main__":
     # start flask
+    startup_once()
     app.run(host=FLASK_HOST, port=FLASK_PORT)

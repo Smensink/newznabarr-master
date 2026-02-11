@@ -25,7 +25,9 @@ class StandardEbooksSearch(PluginSearchBase):
         Search Standard Ebooks by scraping their ebooks page
         Uses Selenium for JavaScript rendering
         """
+        self.last_error = None
         if not query:
+            self.last_error = "Missing query"
             return []
         
         from selenium_helper import SeleniumHelper
@@ -44,10 +46,13 @@ class StandardEbooksSearch(PluginSearchBase):
             results = self._convert_results(books, cat)
             
             print(f"Found {len(results)} results from Standard Ebooks")
+            if not results:
+                self.last_error = "No results returned"
             return results
             
         except Exception as e:
             print(f"Standard Ebooks error: {e}")
+            self.last_error = str(e)
             return []
     
     def _parse_ebooks_page(self, html, query):
@@ -57,8 +62,10 @@ class StandardEbooksSearch(PluginSearchBase):
         soup = BeautifulSoup(html, 'html.parser')
         books = []
         
-        # Find all ebook links (they link to /ebooks/author/title)
-        ebook_links = soup.find_all('a', href=re.compile(r'/ebooks/[^/]+/[^/]+$'))
+        # Find all ebook links. Support both:
+        # - /ebooks/author-slug/title-slug
+        # - /ebooks/author-slug_title-slug
+        ebook_links = soup.find_all('a', href=re.compile(r'^/ebooks/[^?#]+$'))
         
         for link in ebook_links:
             try:
@@ -67,18 +74,34 @@ class StandardEbooksSearch(PluginSearchBase):
                 if not book_path or not book_path.startswith('/'):
                     continue
                 
-                # Extract author and title from path
-                # Path format: /ebooks/author-slug/title-slug
+                # Extract author and title from supported path formats.
                 parts = book_path.strip('/').split('/')
-                if len(parts) < 3:
+                if len(parts) < 2:
                     continue
-                    
-                author_slug = parts[1]
-                title_slug = parts[2]
+
+                author_slug = ""
+                title_slug = ""
+                if len(parts) >= 3:
+                    author_slug = parts[1]
+                    title_slug = parts[2]
+                elif len(parts) == 2 and "_" in parts[1]:
+                    author_slug, title_slug = parts[1].split("_", 1)
+                else:
+                    continue
+                if not author_slug or not title_slug:
+                    continue
                 
                 # Convert slugs to readable text
-                author = author_slug.replace('-', ' ').title()
-                title = title_slug.replace('-', ' ').title()
+                author = author_slug.replace('-', ' ').replace('_', ' ').title()
+                title = title_slug.replace('-', ' ').replace('_', ' ').title()
+
+                # Prefer explicit markup text when present.
+                title_markup = link.select_one('[itemprop="name"]')
+                author_markup = link.select_one('[itemprop="author"]')
+                if title_markup:
+                    title = title_markup.get_text(" ", strip=True)
+                if author_markup:
+                    author = author_markup.get_text(" ", strip=True)
                 
                 # Filter by query (case-insensitive)
                 if query not in title.lower() and query not in author.lower():
@@ -87,10 +110,9 @@ class StandardEbooksSearch(PluginSearchBase):
                 # Construct full URL
                 book_url = f"{self.BASE_URL}{book_path}"
                 
-                # Construct download URLs from path
-                # Note: Standard Ebooks requires ?source=download parameter to trigger actual download
+                # Construct download URL from path.
                 book_slug = title_slug
-                epub_url = f"{book_url}/downloads/{author_slug}_{book_slug}.epub?source=download"
+                epub_url = f"{book_url}/downloads/{author_slug}_{book_slug}.epub"
                 
                 book = {
                     'title': title,
