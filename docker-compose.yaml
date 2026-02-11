@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  newznabarr:
+    build: .
+    image: newznabarr:latest
+    container_name: newznabarr
+    environment:
+      FLASK_RUN_HOST: 0.0.0.0
+      FLASK_RUN_PORT: 10000
+      PUID: 1000
+      PGID: 1000
+      CONFIG: /config
+    ports:
+      - "10000:10000"
+    volumes:
+      - ./:/app
+      - ./downloads:/downloads
+    depends_on:
+      - flaresolverr
+    restart: unless-stopped
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    environment:
+      - LOG_LEVEL=info
+      - LOG_HTML=false
+      - CAPTCHA_SOLVER=none
+    ports:
+      - "8191:8191"
+    restart: unless-stopped

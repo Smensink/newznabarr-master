@@ -1,0 +1,38 @@
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.pytest_cache/
+
+# Application specific
+downloads/
+data/
+*.db
+*.sqlite3
+config/config.json
+config/sabqueue.json
+config/history.json
+config/logs.json
+
+# Tests
+test_*.py
+tests/
+scripts/

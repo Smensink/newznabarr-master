@@ -1,0 +1,37 @@
+{
+  "download_directory": "./data/downloads/downloadarr",
+  "sab_api": "abcde",
+  "sab_categories": [
+    "readarr",
+    "lidarr",
+    "sonarr",
+    "lidarr_audiobook"
+  ],
+  "libgen_mirrors": [
+    "https://libgen.li/index.php",
+    "https://libgen.vg/index.php",
+    "https://libgen.la/index.php",
+    "https://libgen.gl/index.php",
+    "https://libgen.bz/index.php"
+  ],
+  "plugin_settings": {
+    "libgen": {
+      "enabled": true
+    },
+    "annas_archive": {
+      "enabled": false
+    },
+    "openlibrary": {
+      "enabled": false
+    },
+    "gutendex": {
+      "enabled": false
+    },
+    "standardebooks": {
+      "enabled": false
+    },
+    "manybooks": {
+      "enabled": false
+    }
+  }
+}
